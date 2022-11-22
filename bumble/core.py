@@ -83,6 +83,10 @@ class BaseError(Exception):
         return f'{type(self).__name__}({namespace}{name})'
 
 
+class ControllerDiedError(Exception):
+    """ Controller died unexpectedly """
+
+
 class ProtocolError(BaseError):
     """ Protocol Error """
 
@@ -97,6 +101,10 @@ class CommandTimeoutError(Exception):
 
 class InvalidStateError(Exception):
     """ Invalid State Error """
+
+
+class ConnectionDiedError(Exception):
+    """ Connection died unexpectedly """
 
 
 class ConnectionError(BaseError):

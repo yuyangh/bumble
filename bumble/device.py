@@ -450,6 +450,12 @@ class Connection(CompositeEventEmitter):
     def create_l2cap_connector(self, psm):
         return self.device.create_l2cap_connector(self, psm)
 
+    def while_alive(self, coro_or_future):
+        future = self.device.while_alive(coro_or_future)
+        listener = self.on('disconnection', lambda _: future.set_exception(ConnectionDiedError))
+        future.add_done_callback(lambda _: self.remove_listener('disconnection', listener))
+        return future
+
     async def open_l2cap_channel(
         self,
         psm,
@@ -483,7 +489,7 @@ class Connection(CompositeEventEmitter):
         self.on('disconnection_failure', abort.set_exception)
 
         try:
-            await asyncio.wait_for(abort, timeout)
+            await asyncio.wait_for(self.device.while_alive(abort), timeout)
         except asyncio.TimeoutError:
             pass
 
@@ -842,6 +848,9 @@ class Device(CompositeEventEmitter):
         mps=DEVICE_DEFAULT_L2CAP_COC_MPS
     ):
         return self.l2cap_channel_manager.register_le_coc_server(psm, server, max_credits, mtu, mps)
+
+    def while_alive(self, coro_or_future):
+        return self.host.while_alive(coro_or_future)
 
     async def open_l2cap_channel(
         self,
@@ -1365,7 +1374,7 @@ class Device(CompositeEventEmitter):
             if transport == BT_LE_TRANSPORT:
                 self.le_connecting = True
             if timeout is None:
-                return await pending_connection
+                return await self.while_alive(pending_connection)
             else:
                 try:
                     return await asyncio.wait_for(asyncio.shield(pending_connection), timeout)
@@ -1376,7 +1385,7 @@ class Device(CompositeEventEmitter):
                         await self.send_command(HCI_Create_Connection_Cancel_Command(bd_addr=peer_address))
 
                     try:
-                        return await pending_connection
+                        return await self.while_alive(pending_connection)
                     except ConnectionError:
                         raise TimeoutError()
         finally:
@@ -1426,6 +1435,7 @@ class Device(CompositeEventEmitter):
 
         try:
             # Wait for a request or a completed connection
+            pending_request = self.while_alive(pending_request)
             result = await (asyncio.wait_for(pending_request, timeout) if timeout else pending_request)
         except Exception:
             # Remove future from device context
@@ -1443,6 +1453,9 @@ class Device(CompositeEventEmitter):
         # Otherwise, result came from `on_connection_request`
         peer_address, class_of_device, link_type = result
 
+        # Create a future so that we can wait for the connection's result
+        pending_connection = asyncio.get_running_loop().create_future()
+
         def on_connection(connection):
             if connection.transport == BT_BR_EDR_TRANSPORT and connection.peer_address == peer_address:
                 pending_connection.set_result(connection)
@@ -1451,8 +1464,6 @@ class Device(CompositeEventEmitter):
             if error.transport == BT_BR_EDR_TRANSPORT and error.peer_address == peer_address:
                 pending_connection.set_exception(error)
 
-        # Create a future so that we can wait for the connection's result
-        pending_connection = asyncio.get_running_loop().create_future()
         self.on('connection', on_connection)
         self.on('connection_failure', on_connection_failure)
 
@@ -1467,7 +1478,7 @@ class Device(CompositeEventEmitter):
             ))
 
             # Wait for connection complete
-            return await pending_connection
+            return await self.while_alive(pending_connection)
 
         finally:
             self.remove_listener('connection', on_connection)
@@ -1527,7 +1538,7 @@ class Device(CompositeEventEmitter):
 
             # Wait for the disconnection process to complete
             self.disconnecting = True
-            return await pending_disconnection
+            return await self.while_alive(pending_disconnection)
         finally:
             connection.remove_listener('disconnection', pending_disconnection.set_result)
             connection.remove_listener('disconnection_failure', pending_disconnection.set_exception)
@@ -1640,7 +1651,7 @@ class Device(CompositeEventEmitter):
             else:
                 return None
 
-            return await peer_address
+            return await self.while_alive(peer_address)
         finally:
             if handler is not None:
                 self.remove_listener(event_name, handler)
@@ -1720,7 +1731,7 @@ class Device(CompositeEventEmitter):
             connection.authenticating = True
 
             # Wait for the authentication to complete
-            await pending_authentication
+            await connection.while_alive(pending_authentication)
         finally:
             connection.authenticating = False
             connection.remove_listener('connection_authentication', on_authentication)
@@ -1789,7 +1800,7 @@ class Device(CompositeEventEmitter):
                     raise HCI_StatusError(result)
 
             # Wait for the result
-            await pending_encryption
+            await connection.while_alive(pending_encryption)
         finally:
             connection.remove_listener('connection_encryption_change',  on_encryption_change)
             connection.remove_listener('connection_encryption_failure', on_encryption_failure)
@@ -1827,10 +1838,13 @@ class Device(CompositeEventEmitter):
                 raise HCI_StatusError(result)
 
             # Wait for the result
-            return await pending_name
+            return await self.while_alive(pending_name)
         finally:
             self.remove_listener('remote_name', handler)
             self.remove_listener('remote_name_failure', failure_handler)
+
+    def on_flush(self):
+        self.emit('flush', ControllerDiedError())
 
     # [Classic only]
     @host_event_handler
@@ -1846,7 +1860,7 @@ class Device(CompositeEventEmitter):
                 except Exception as error:
                     logger.warn(f'!!! error while storing keys: {error}')
 
-            asyncio.create_task(store_keys())
+            self.while_alive(store_keys())
 
         if (connection := self.find_connection_by_bd_addr(bd_addr, transport=BT_BR_EDR_TRANSPORT)):
             connection.link_key_type = key_type
@@ -1946,7 +1960,7 @@ class Device(CompositeEventEmitter):
                 # Emit an event to notify listeners of the new connection
                 self.emit('connection', connection)
 
-            asyncio.create_task(new_connection())
+            self.while_alive(new_connection())
 
     @host_event_handler
     def on_connection_failure(self, transport, peer_address, error_code):
@@ -2018,7 +2032,7 @@ class Device(CompositeEventEmitter):
         # Restart advertising if auto-restart is enabled
         if self.auto_restart_advertising:
             logger.debug('restarting advertising')
-            asyncio.create_task(self.start_advertising(
+            self.while_alive(self.start_advertising(
                 advertising_type = self.advertising_type,
                 auto_restart     = True
             ))
@@ -2132,28 +2146,28 @@ class Device(CompositeEventEmitter):
             async def compare_numbers():
                 numbers_match = await pairing_config.delegate.compare_numbers(code, digits=6)
                 if numbers_match:
-                    self.host.send_command_sync(
+                    await self.host.send_command(
                         HCI_User_Confirmation_Request_Reply_Command(bd_addr=connection.peer_address)
                     )
                 else:
-                    self.host.send_command_sync(
+                    await self.host.send_command(
                         HCI_User_Confirmation_Request_Negative_Reply_Command(bd_addr=connection.peer_address)
                     )
 
-            asyncio.create_task(compare_numbers())
+            connection.while_alive(compare_numbers())
         else:
             async def confirm():
                 confirm = await pairing_config.delegate.confirm()
                 if confirm:
-                    self.host.send_command_sync(
+                    await self.host.send_command(
                         HCI_User_Confirmation_Request_Reply_Command(bd_addr=connection.peer_address)
                     )
                 else:
-                    self.host.send_command_sync(
+                    await self.host.send_command(
                         HCI_User_Confirmation_Request_Negative_Reply_Command(bd_addr=connection.peer_address)
                     )
 
-            asyncio.create_task(confirm())
+            connection.while_alive(confirm())
 
     # [Classic only]
     @host_event_handler
@@ -2172,17 +2186,17 @@ class Device(CompositeEventEmitter):
             async def get_number():
                 number = await pairing_config.delegate.get_number()
                 if number is not None:
-                    self.host.send_command_sync(
+                    await self.host.send_command(
                         HCI_User_Passkey_Request_Reply_Command(
                             bd_addr       = connection.peer_address,
                             numeric_value = number)
                     )
                 else:
-                    self.host.send_command_sync(
+                    await self.host.send_command(
                         HCI_User_Passkey_Request_Negative_Reply_Command(bd_addr=connection.peer_address)
                     )
 
-            asyncio.create_task(get_number())
+            self.while_alive(get_number())
         else:
             self.host.send_command_sync(
                 HCI_User_Passkey_Request_Negative_Reply_Command(bd_addr=connection.peer_address)
@@ -2195,7 +2209,7 @@ class Device(CompositeEventEmitter):
         # Ask what the pairing config should be for this connection
         pairing_config = self.pairing_config_factory(connection)
 
-        asyncio.create_task(pairing_config.delegate.display_number(passkey))
+        connection.while_alive(pairing_config.delegate.display_number(passkey))
 
     # [Classic only]
     @host_event_handler

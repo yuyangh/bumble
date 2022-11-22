@@ -59,7 +59,6 @@ class Connection:
         l2cap_pdu = L2CAP_PDU.from_bytes(pdu)
         self.host.on_l2cap_pdu(self, l2cap_pdu.cid, l2cap_pdu.payload)
 
-
 # -----------------------------------------------------------------------------
 class Host(EventEmitter):
     def __init__(self, controller_source = None, controller_sink = None):
@@ -92,9 +91,18 @@ class Host(EventEmitter):
         if controller_sink:
             self.set_packet_sink(controller_sink)
 
+    def while_alive(self, coro_or_future):
+        future = asyncio.ensure_future(coro_or_future)
+        listener = self.on('flush', lambda: future.set_exception(ControllerDiedError))
+        future.add_done_callback(lambda _: self.remove_listener('flush', listener))
+        return future
+
     async def reset(self):
         await self.send_command(HCI_Reset_Command(), check_result=True)
         self.ready = True
+
+        # Flush current host state
+        self.emit('flush')
 
         response = await self.send_command(HCI_Read_Local_Supported_Commands_Command(), check_result=True)
         self.local_supported_commands = response.return_parameters.supported_commands
@@ -217,7 +225,7 @@ class Host(EventEmitter):
         async def send_command(command):
             await self.send_command(command)
 
-        asyncio.create_task(send_command(command))
+        self.while_alive(send_command(command))
 
     def send_l2cap_pdu(self, connection_handle, cid, pdu):
         l2cap_pdu = L2CAP_PDU(cid, pdu).to_bytes()
@@ -534,7 +542,7 @@ class Host(EventEmitter):
 
             await self.send_command(response)
 
-        asyncio.create_task(send_long_term_key())
+        self.while_alive(send_long_term_key())
 
     def on_hci_synchronous_connection_complete_event(self, event):
         pass
@@ -627,7 +635,7 @@ class Host(EventEmitter):
 
             await self.send_command(response)
 
-        asyncio.create_task(send_link_key())
+        self.while_alive(send_link_key())
 
     def on_hci_io_capability_request_event(self, event):
         self.emit('authentication_io_capability_request', event.bd_addr)
